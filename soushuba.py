@@ -59,7 +59,9 @@ class SouShuBaClient:
 
     def __init__(self, hostname: str, username: str, password: str, questionid: str = '0', answer: str = None,
                  proxies: dict | None = None):
-        self.session: requests.Session = requests.Session()
+        slfSession = requests.Session()
+        slfSession.verify = False
+        self.session: requests.Session = slfSession
         self.hostname = hostname
         self.username = username
         self.password = password
