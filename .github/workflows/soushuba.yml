@@ -1,8 +1,14 @@
 name: Run soushuba qiandao
 on:
   push:
+    branches: [master]
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      check_only:
+        description: '只登录和查询余额，不发布空间动态'
+        type: boolean
+        default: false
   schedule:
     - cron: '0 21 * * *'
 
@@ -23,4 +29,42 @@ jobs:
           python-version: '3.13'
           cache: 'pip'
       - run: pip install -r requirements.txt
+      - name: Diagnose credit response
+        if: ${{ inputs.check_only }}
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from urllib.parse import urlparse
+          from bs4 import BeautifulSoup
+          from soushuba import SouShuBaClient, get_refresh_url, get_url
+
+          first = get_refresh_url('http://' + os.environ['SOUSHUBA_HOSTNAME'])
+          second = get_refresh_url(first)
+          forum = get_url(second)
+          client = SouShuBaClient(urlparse(forum).hostname,
+                                 os.environ['SOUSHUBA_USERNAME'],
+                                 os.environ['SOUSHUBA_PASSWORD'])
+          client.login()
+          print('Authenticated cookie:', any(c.name.endswith('_auth') and c.value for c in client.session.cookies))
+          for name, query in [
+              ('ajax menu', 'mod=spacecp&ac=credit&showcredit=1&inajax=1&ajaxtarget=extcreditmenu_menu'),
+              ('credit page', 'mod=spacecp&ac=credit&op=base'),
+          ]:
+              response = client.session.get(f'https://{client.hostname}/home.php?{query}', verify=False, timeout=30)
+              print(name, 'HTTP:', response.status_code, 'Content-Type:', response.headers.get('Content-Type'))
+              response.raise_for_status()
+              html = response.text
+              if html.lstrip().startswith('<?xml'):
+                  html = ET.fromstring(html).text or ''
+              soup = BeautifulSoup(html, 'html.parser')
+              print(name, 'credit IDs:', [node.get('id') for node in soup.select('[id^=hcredit_]')])
+              print(name, 'login form:', bool(soup.select_one('form[id^=loginform_]')))
+              print(name, 'credit list labels:', [node.get_text(' ', strip=True) for node in soup.select('ul.creditl > li > em')])
+              silver = soup.find(string=lambda text: text and '银币' in text)
+              if silver:
+                  print(name, 'silver parent tags:', [node.name for node in list(silver.parents)[:4]])
+          client.session.close()
+          PY
       - run: python soushuba.py
+        if: ${{ !inputs.check_only }}
