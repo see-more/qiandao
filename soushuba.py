@@ -10,7 +10,7 @@ from copy import copy
 
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 import time
 import logging
 import urllib3
@@ -79,10 +79,18 @@ class SouShuBaClient:
         self.proxies = proxies
 
     def login_form_hash(self):
-        rst = self.session.get(f'https://{self.hostname}/member.php?mod=logging&action=login', verify=False).text
-        loginhash = re.search(r'<div id="main_messaqge_(.+?)">', rst).group(1)
-        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
-        return loginhash, formhash
+        response = self.session.get(f'https://{self.hostname}/member.php?mod=logging&action=login', verify=False)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        for form in soup.find_all('form', action=True):
+            params = parse_qs(urlparse(form['action']).query)
+            if params.get('mod') != ['logging'] or params.get('action') != ['login']:
+                continue
+            loginhash = params.get('loginhash', [None])[0]
+            token = form.find('input', attrs={'name': 'formhash'})
+            if loginhash and token and token.get('value'):
+                return loginhash, token['value']
+        raise RuntimeError('无法读取登录表单令牌，请检查站点响应或登录表单')
 
     def login(self):
         """Login with username and password"""
@@ -115,27 +123,33 @@ class SouShuBaClient:
         response = self.session.get(credit_url, verify=False, timeout=30)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, features="lxml")
-        if soup.select_one('form[id^="loginform_"]') or '您需要先登录才能继续本操作' in soup.get_text():
+        text = soup.get_text('\n', strip=True)
+        if soup.find('input', type='password') or '您需要先登录才能继续本操作' in text:
             raise RuntimeError('查询银币失败：登录状态已失效，请重新登录')
 
-        # 顶部 AJAX 菜单可能隐藏积分；完整积分页按币种名称展示实际余额。
-        for item in soup.select('ul.creditl > li'):
-            label = item.find('em', recursive=False)
-            if label is None or label.get_text(strip=True).rstrip(':：').strip() != '银币':
-                continue
-            label.decompose()
+        # 只约定“银币：数值”的业务含义，不绑定展示元素的 ID、class 或标签层级。
+        balances = set()
+        for label in re.finditer(r'(?:^|\n)银币\s*[:：]\s*', text):
             balance = re.match(r'([+-]?\d+(?:,\d{3})*(?:\.\d+)?)(?=\s|$)',
-                               item.get_text(' ', strip=True))
+                               text[label.end():])
             if balance is None:
                 raise RuntimeError('查询银币失败：银币字段不是有效数字')
-            return balance.group(1).replace(',', '')
+            balances.add(balance.group(1).replace(',', ''))
 
-        raise RuntimeError('查询银币失败：完整积分页缺少“银币”字段，请检查站点响应或页面结构')
+        if not balances:
+            raise RuntimeError('查询银币失败：完整积分页缺少“银币”字段，请检查站点响应或页面结构')
+        if len(balances) != 1:
+            raise RuntimeError('查询银币失败：页面包含不同的银币数值，无法确定实际余额')
+        return balances.pop()
 
     def space_form_hash(self):
-        rst = self.session.get(f'https://{self.hostname}/home.php', verify=False).text
-        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
-        return formhash
+        response = self.session.get(f'https://{self.hostname}/home.php', verify=False)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        token = soup.find('input', attrs={'name': 'formhash'})
+        if token is None or not token.get('value'):
+            raise RuntimeError('无法读取空间表单令牌，请检查登录状态或站点响应')
+        return token['value']
 
     def space(self):
         formhash = self.space_form_hash()

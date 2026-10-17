@@ -29,6 +29,32 @@ class CreditTests(unittest.TestCase):
         with patch.object(self.client.session, 'get', return_value=response(page)):
             self.assertEqual(self.client.credit(), '123')
 
+    def test_balance_survives_changed_ids_classes_and_tag_hierarchy(self):
+        for page in [
+            '<section id="new-id" class="new-class"><div><b>银币：</b><output>123</output></div></section>',
+            '<table><tr><th><span>银币</span><i>：</i></th><td><strong>123</strong></td></tr></table>',
+            '<p>银币：123 枚</p>',
+        ]:
+            with self.subTest(page=page):
+                with patch.object(self.client.session, 'get', return_value=response(page)):
+                    self.assertEqual(self.client.credit(), '123')
+
+    def test_conflicting_silver_amounts_are_not_guessed(self):
+        page = '<section>银币：123</section><aside>银币：456</aside>'
+        with patch.object(self.client.session, 'get', return_value=response(page)):
+            with self.assertRaises(RuntimeError):
+                self.client.credit()
+
+    def test_repeated_equivalent_balances_are_unambiguous(self):
+        page = '<header>银币：1,234</header><main>银币：1234</main>'
+        with patch.object(self.client.session, 'get', return_value=response(page)):
+            self.assertEqual(self.client.credit(), '1234')
+
+    def test_script_and_style_content_are_not_account_balances(self):
+        page = '<script>银币：456</script><style>银币：789</style><div>银币：123</div>'
+        with patch.object(self.client.session, 'get', return_value=response(page)):
+            self.assertEqual(self.client.credit(), '123')
+
     def test_zero_negative_and_formatted_balances_are_not_replaced_with_defaults(self):
         for value, expected in [('0', '0'), ('-12', '-12'), ('1,234.50', '1234.50')]:
             with self.subTest(value=value):
@@ -67,6 +93,30 @@ class CreditTests(unittest.TestCase):
             with patch.object(self.client.session, 'post', return_value=response('登录失败')):
                 with self.assertRaisesRegex(RuntimeError, '未取得 Discuz 认证 Cookie'):
                     self.client.login()
+
+    def test_login_tokens_come_from_the_login_form_not_presentation_ids(self):
+        page = '''<form action="search.php"><input name="formhash" value="search-token"></form>
+          <form id="renamed" action="member.php?action=login&amp;loginhash=actual-login&amp;mod=logging&amp;loginsubmit=yes">
+            <input value="actual-form" data-new="yes" name="formhash" type="hidden">
+          </form>'''
+        with patch.object(self.client.session, 'get', return_value=response(page)):
+            self.assertEqual(self.client.login_form_hash(), ('actual-login', 'actual-form'))
+
+    def test_login_without_required_protocol_tokens_is_rejected(self):
+        page = '<form action="member.php?mod=logging&amp;action=login"><input name="formhash" value="token"></form>'
+        with patch.object(self.client.session, 'get', return_value=response(page)):
+            with self.assertRaises(RuntimeError):
+                self.client.login_form_hash()
+
+    def test_space_token_does_not_depend_on_html_attribute_order_or_quotes(self):
+        page = "<form><input value='actual-form' type='hidden' name='formhash'></form>"
+        with patch.object(self.client.session, 'get', return_value=response(page)):
+            self.assertEqual(self.client.space_form_hash(), 'actual-form')
+
+    def test_space_without_protocol_token_is_rejected(self):
+        with patch.object(self.client.session, 'get', return_value=response('<p>请登录</p>')):
+            with self.assertRaises(RuntimeError):
+                self.client.space_form_hash()
 
 
 if __name__ == '__main__':
