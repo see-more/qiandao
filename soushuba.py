@@ -2,6 +2,7 @@
 """
 实现搜书吧论坛登入和发布空间动态
 """
+import argparse
 import os
 import re
 import sys
@@ -9,8 +10,7 @@ from copy import copy
 
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
-import xml.etree.ElementTree as ET
+from urllib.parse import parse_qs, urlparse
 import time
 import logging
 import urllib3
@@ -79,10 +79,18 @@ class SouShuBaClient:
         self.proxies = proxies
 
     def login_form_hash(self):
-        rst = self.session.get(f'https://{self.hostname}/member.php?mod=logging&action=login', verify=False).text
-        loginhash = re.search(r'<div id="main_messaqge_(.+?)">', rst).group(1)
-        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
-        return loginhash, formhash
+        response = self.session.get(f'https://{self.hostname}/member.php?mod=logging&action=login', verify=False)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        for form in soup.find_all('form', action=True):
+            params = parse_qs(urlparse(form['action']).query)
+            if params.get('mod') != ['logging'] or params.get('action') != ['login']:
+                continue
+            loginhash = params.get('loginhash', [None])[0]
+            token = form.find('input', attrs={'name': 'formhash'})
+            if loginhash and token and token.get('value'):
+                return loginhash, token['value']
+        raise RuntimeError('无法读取登录表单令牌，请检查站点响应或登录表单')
 
     def login(self):
         """Login with username and password"""
@@ -104,29 +112,44 @@ class SouShuBaClient:
         }
 
         resp = self.session.post(login_url, proxies=self.proxies, data=payload, headers=headers, verify=False)
-        if resp.status_code == 200:
-            logger.info(f'Welcome {self.username}!')
-        else:
-            raise ValueError('Verify Failed! Check your username and password!')
+        resp.raise_for_status()
+        if not any(cookie.name.endswith('_auth') and cookie.value
+                   for cookie in self.session.cookies):
+            raise RuntimeError('登录失败：未取得 Discuz 认证 Cookie，请检查账号、密码或安全提问')
+        logger.info(f'Welcome {self.username}!')
 
     def credit(self):
-        credit_url = f"https://{self.hostname}/home.php?mod=spacecp&ac=credit&showcredit=1&inajax=1&ajaxtarget=extcreditmenu_menu"
-        credit_rst = self.session.get(credit_url, verify=False).text
+        credit_url = f"https://{self.hostname}/home.php?mod=spacecp&ac=credit&op=base"
+        response = self.session.get(credit_url, verify=False, timeout=30)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, features="lxml")
+        text = soup.get_text('\n', strip=True)
+        if soup.find('input', type='password') or '您需要先登录才能继续本操作' in text:
+            raise RuntimeError('查询银币失败：登录状态已失效，请重新登录')
 
-        # 解析 XML，提取 CDATA
-        root = ET.fromstring(str(credit_rst))
-        cdata_content = root.text
+        # 只约定“银币：数值”的业务含义，不绑定展示元素的 ID、class 或标签层级。
+        balances = set()
+        for label in re.finditer(r'(?:^|\n)银币\s*[:：]\s*', text):
+            balance = re.match(r'([+-]?\d+(?:,\d{3})*(?:\.\d+)?)(?=\s|$)',
+                               text[label.end():])
+            if balance is None:
+                raise RuntimeError('查询银币失败：银币字段不是有效数字')
+            balances.add(balance.group(1).replace(',', ''))
 
-        # 使用 BeautifulSoup 解析 CDATA 内容
-        cdata_soup = BeautifulSoup(cdata_content, features="lxml")
-        hcredit_2 = cdata_soup.find("span", id="hcredit_2").string
-
-        return hcredit_2
+        if not balances:
+            raise RuntimeError('查询银币失败：完整积分页缺少“银币”字段，请检查站点响应或页面结构')
+        if len(balances) != 1:
+            raise RuntimeError('查询银币失败：页面包含不同的银币数值，无法确定实际余额')
+        return balances.pop()
 
     def space_form_hash(self):
-        rst = self.session.get(f'https://{self.hostname}/home.php', verify=False).text
-        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
-        return formhash
+        response = self.session.get(f'https://{self.hostname}/home.php', verify=False)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        token = soup.find('input', attrs={'name': 'formhash'})
+        if token is None or not token.get('value'):
+            raise RuntimeError('无法读取空间表单令牌，请检查登录状态或站点响应')
+        return token['value']
 
     def space(self):
         formhash = self.space_form_hash()
@@ -153,6 +176,10 @@ class SouShuBaClient:
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='搜书吧自动签到及余额查询')
+    parser.add_argument('--check-only', action='store_true',
+                        help='只登录和查询银币余额，不发布空间动态')
+    args = parser.parse_args()
     try:
         redirect_url = get_refresh_url('http://' + os.environ.get('SOUSHUBA_HOSTNAME', 'www.soushu2035.com'))
         time.sleep(2)
@@ -163,7 +190,8 @@ if __name__ == '__main__':
                                 os.environ.get('SOUSHUBA_USERNAME', "USERNAME"),
                                 os.environ.get('SOUSHUBA_PASSWORD', "PASSWORD"))
         client.login()
-        client.space()
+        if not args.check_only:
+            client.space()
         credit = client.credit()
         logger.info(f'{client.username} have {credit} coins!')
     except Exception as e:

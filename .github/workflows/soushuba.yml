@@ -1,8 +1,14 @@
 name: Run soushuba qiandao
 on:
   push:
+    branches: [master]
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      check_only:
+        description: '只登录和查询余额，不发布空间动态'
+        type: boolean
+        default: false
   schedule:
     - cron: '0 21 * * *'
 
@@ -23,4 +29,9 @@ jobs:
           python-version: '3.13'
           cache: 'pip'
       - run: pip install -r requirements.txt
+      - run: python -m unittest -v test_soushuba
+      - name: Check login and credit without posting
+        if: ${{ inputs.check_only }}
+        run: python soushuba.py --check-only
       - run: python soushuba.py
+        if: ${{ !inputs.check_only }}
